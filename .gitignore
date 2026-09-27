@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.bun/
+
+# Build outputs
+dist/
+out/
+build/
+
+# Foundry artifacts
+contracts/out/
+contracts/cache/
+
+# Environment secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# .env.example is safe to commit (placeholder names only, no values)
+
+# Goldsky / database credentials
+# (covered by .env above, but listed explicitly for clarity)
+
+# Circle entity secret recovery files
+.circle/
+
+# Logs
+*.log
+/tmp/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

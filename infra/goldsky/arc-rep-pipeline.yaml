@@ -1,0 +1,211 @@
+# infra/goldsky/arc-rep-pipeline.yaml
+#
+# Goldsky Mirror pipeline definition for Arc Rep historical activity data.
+#
+# PURPOSE
+# -------
+# This pipeline replicates two Arc Testnet chain-level datasets into a
+# developer-owned Postgres database, providing the historical activity data
+# required for the future GoldskyActivityProvider.
+#
+# The pipeline is intentionally scoped to only the data Arc Rep needs:
+#   - arc_testnet.receipt_transactions — full transaction + receipt data
+#   - arc_testnet.raw_logs             — ERC-20 Transfer events
+#
+# DEPLOYING
+# ---------
+# Prerequisites:
+#   1. A Goldsky account with a secret key (GOLDSKY_API_KEY in .env).
+#   2. A Postgres database accessible from Goldsky's network
+#      (connection string in GOLDSKY_POSTGRES_URL in .env).
+#   3. Goldsky CLI installed: npm install -g @goldskycom/cli
+#
+# Deploy:
+#   goldsky pipeline create arc-rep-historical \
+#     --definition-path infra/goldsky/arc-rep-pipeline.yaml
+#
+# Monitor:
+#   goldsky pipeline list
+#   goldsky pipeline status arc-rep-historical
+#
+# Stop:
+#   goldsky pipeline stop arc-rep-historical
+#
+# IMPORTANT: Do not commit GOLDSKY_API_KEY or GOLDSKY_POSTGRES_URL.
+# See .env.example for the required environment variable names.
+#
+# Chain: Arc Testnet (Goldsky slug: arc-testnet)
+# Chain ID: 5042002
+# Goldsky support: Blocks ✓ | Enriched Transactions ✓ | Logs ✓ | Traces ✓
+# Reference: https://docs.goldsky.com/chains/arc
+#
+# KNOWN OPEN QUESTION (must resolve before implementing GoldskyActivityProvider)
+# -------------------------------------------------------------------------------
+# The arc_testnet.raw_logs.topics column is typed "string" in Goldsky's schema.
+# The exact serialization format (comma-delimited, JSON array, pipe-delimited,
+# or another representation) has not been confirmed from documentation.
+# Before implementing GoldskyActivityProvider, query the live Postgres sink:
+#
+#   SELECT topics
+#   FROM arc_usdc_transfers
+#   LIMIT 5;
+#
+# Document the actual type, delimiter, and topic ordering here before writing
+# any parsing code. See docs/PHASE5_HISTORICAL_PROVIDER_SPEC.md §13.
+
+sources:
+  # -----------------------------------------------------------------------
+  # Source 1: Arc Testnet enriched transactions
+  #
+  # Goldsky dataset: arc_testnet.receipt_transactions
+  # This is an "Enriched Transactions" dataset — it combines transaction
+  # data with receipt data in a single row, eliminating the need for
+  # separate receipt fetches.
+  #
+  # Required columns for NormalizedTransaction:
+  #   hash                    → NormalizedTransaction.hash
+  #   block_number            → NormalizedTransaction.blockNumber (bigint)
+  #   block_timestamp         → NormalizedTransaction.timestamp (unix seconds)
+  #   from_address            → NormalizedTransaction.from
+  #   to_address              → NormalizedTransaction.to (null = contract creation)
+  #   value                   → NormalizedTransaction.valueWei (native 18-decimal)
+  #   receipt_status          → NormalizedTransaction.succeeded (1 = success)
+  #   input                   → NormalizedTransaction.hasInputData / input data
+  #   receipt_contract_address → NormalizedTransaction.createdContractAddress
+  #   nonce                   → NormalizedActivity.totalOutgoingTransactionCount (per-tx nonce)
+  #
+  # Note: value is a decimal type in Goldsky's schema. The provider must
+  # convert to bigint (wei) — do not lose precision.
+  # -----------------------------------------------------------------------
+  arc_transactions:
+    type: dataset
+    name: arc-testnet.receipt_transactions
+    version: 1.0.0
+    # No filter — replicate all transactions. The provider queries by wallet
+    # address. A wallet-based filter here would require a separate pipeline
+    # per wallet, which is not viable.
+
+  # -----------------------------------------------------------------------
+  # Source 2: Arc Testnet raw logs
+  #
+  # Goldsky dataset: arc_testnet.raw_logs
+  # Contains all ERC-20 Transfer events (and all other contract events).
+  #
+  # Required columns for DecodedErc20Transfer reconstruction:
+  #   transaction_hash  → links to NormalizedTransaction.hash
+  #   address           → DecodedErc20Transfer.tokenAddress (log emitter)
+  #   topics            → [topic0=Transfer sig, topic1=from, topic2=to]
+  #   data              → ABI-encoded uint256 amount
+  #   block_timestamp   → for ordering and observation-period calculations
+  #   block_number      → for sync-lag detection
+  #
+  # EIP-7708 NOTE:
+  # The Arc system emitter (0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE) also
+  # emits Transfer-shaped logs for native USDC transfers. The filter below
+  # excludes the system emitter so only ERC-20 contract logs reach the sink.
+  # This matches the ArcRpcProvider fix in server/data/ArcRpcProvider.ts.
+  # -----------------------------------------------------------------------
+  arc_logs:
+    type: dataset
+    name: arc-testnet.raw_logs
+    version: 1.0.0
+    filter:
+      # Only retain Transfer events (topic0 = keccak256("Transfer(address,address,uint256)"))
+      # AND exclude the Arc EIP-7708 system emitter.
+      # This reduces sink volume significantly while retaining all ERC-20 transfers.
+      where: >
+        topics LIKE '%ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef%'
+        AND LOWER(address) != 'fffffffffffffffffffffffffffffffffffffffe'
+
+transforms:
+  # -----------------------------------------------------------------------
+  # Transform 1: Enrich transactions with wallet-interaction flags.
+  #
+  # These columns help GoldskyActivityProvider reconstruct the same flags
+  # that ArcRpcProvider derives from raw RPC data:
+  #   is_contract_creation: to_address IS NULL
+  #   has_input_data: input IS NOT NULL AND input != '0x' AND LENGTH(input) > 2
+  # -----------------------------------------------------------------------
+  enriched_transactions:
+    primary_source: arc_transactions
+    type: sql
+    sql: >
+      SELECT
+        id,
+        hash,
+        block_number,
+        block_timestamp,
+        from_address,
+        to_address,
+        value,
+        receipt_status,
+        input,
+        receipt_contract_address,
+        nonce,
+        (to_address IS NULL) AS is_contract_creation,
+        (input IS NOT NULL AND input != '0x' AND LENGTH(input) > 2) AS has_input_data,
+        receipt_gas_used,
+        gas_price
+      FROM arc_transactions
+
+  # -----------------------------------------------------------------------
+  # Transform 2: Transfer-event logs only — for ERC-20 decoding.
+  #
+  # The filter in arc_logs source narrows to Transfer events and excludes
+  # the system emitter. This transform renames columns for clarity and
+  # prepares for USDC-specific filtering in GoldskyActivityProvider.
+  # -----------------------------------------------------------------------
+  transfer_logs:
+    primary_source: arc_logs
+    type: sql
+    sql: >
+      SELECT
+        id,
+        transaction_hash,
+        block_number,
+        block_timestamp,
+        address          AS token_address,
+        topics,
+        data             AS amount_data,
+        log_index
+      FROM arc_logs
+      ORDER BY block_number ASC, log_index ASC
+
+sinks:
+  # -----------------------------------------------------------------------
+  # Sink 1: arc_transactions table
+  #
+  # Stores all Arc Testnet transactions with receipt data.
+  # GoldskyActivityProvider will query this with:
+  #   WHERE from_address = $wallet OR to_address = $wallet
+  #
+  # The GOLDSKY_POSTGRES_URL environment variable must be set.
+  # See .env.example for the required format.
+  # -----------------------------------------------------------------------
+  transactions_sink:
+    type: postgres
+    table: arc_transactions
+    schema: public
+    secret_name: arc_rep_postgres   # Goldsky secret name — set via Goldsky dashboard
+    source: enriched_transactions
+    # unique_key is required for upserts (handles reorgs and pipeline restarts)
+    unique_key: id
+
+  # -----------------------------------------------------------------------
+  # Sink 2: arc_transfer_logs table
+  #
+  # Stores Transfer event logs after EIP-7708 system-emitter filtering.
+  # GoldskyActivityProvider will query this with:
+  #   WHERE topics LIKE '%' || padded_wallet_address || '%'
+  #
+  # IMPORTANT: The exact serialization format of the 'topics' column must be
+  # determined empirically before writing the provider query. See the known
+  # open question at the top of this file.
+  # -----------------------------------------------------------------------
+  logs_sink:
+    type: postgres
+    table: arc_transfer_logs
+    schema: public
+    secret_name: arc_rep_postgres
+    source: transfer_logs
+    unique_key: id
